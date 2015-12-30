@@ -12,11 +12,12 @@ import WebKit
 import Foundation
 import AppKit
 import AudioToolbox
+import IOKit.ps
 
-class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
-
+class ViewController: NSViewController, WebFrameLoadDelegate, WKScriptMessageHandler, WKNavigationDelegate {
+    
+    private var mainWebview: WKWebView!
     @IBOutlet var mainWindow: NSView!
-    @IBOutlet weak var mainWebview: WebView!
     @IBOutlet weak var loadingBar: NSProgressIndicator!
     @IBOutlet weak var launchingLabel: NSTextField!
     
@@ -44,7 +45,7 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
         // Do you want a loading bar?
         "showLoadingBar": true,
         
-        "consoleSupport": false
+        "consoleSupport": true
     ]
     
     func webView(sender: WebView!, runJavaScriptAlertPanelWithMessage message: String!, initiatedByFrame frame: WebFrame!) {
@@ -59,22 +60,27 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
     var firstLoadingStarted = false
     var firstAppear = true
     
-    override func viewDidAppear() {
-        if(firstAppear){
-            initWindow()
-        }
+    override func loadView() {
+        super.loadView()
+        // init webview
+
+        self.mainWebview = WKWebView()
+        mainWebview.navigationDelegate = self
+        self.view = self.mainWebview!
     }
     
     override func viewDidLoad() {
         super.viewDidLoad()
         
-        mainWebview.UIDelegate = self
-        
         addObservers()
-        
         initSettings()
-        
-        loadUrl((SETTINGS["url"] as? String)!)
+    }
+    
+    override func viewWillAppear() {
+        if(firstAppear){
+            initWindow()
+            goHome()
+        }
     }
     
     func addObservers(){
@@ -87,20 +93,21 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
     }
     
     func goHome(){
-        loadUrl((SETTINGS["url"] as? String)!)
+        let homeUrl = NSURL(string: SETTINGS["url"] as! String)
+        loadUrl(homeUrl!)
     }
     
     func reload(){
-        let currentUrl: String = (mainWebview.mainFrame.dataSource?.request.URL?.absoluteString)!
-        loadUrl(currentUrl)
+        let currentUrl = mainWebview.URL
+        loadUrl(currentUrl!)
     }
     
     func copyUrl(){
-        let currentUrl: String = (mainWebview.mainFrame.dataSource?.request.URL?.absoluteString)!
+        let currentUrl = mainWebview.URL
         let clipboard: NSPasteboard = NSPasteboard.generalPasteboard()
         clipboard.clearContents()
         
-        clipboard.setString(currentUrl, forType: NSStringPboardType)
+        clipboard.setString(currentUrl?.absoluteString ?? "about:blank", forType: NSStringPboardType)
     }
     
     func initSettings(){
@@ -141,22 +148,22 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
         mainWindow.window?.setFrame(frame, display: true)
         
         // set window title
-        mainWindow.window!.title = SETTINGS["title"] as! String
+        mainWindow.window?.title = SETTINGS["title"] as! String
         
         // Force some preferences before loading...
-        mainWebview.preferences.javaScriptEnabled = true
-        mainWebview.preferences.javaScriptCanOpenWindowsAutomatically = true
-        mainWebview.preferences.plugInsEnabled = true
+        let config = mainWebview.configuration
+        config.preferences.javaScriptEnabled = true
+        config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        config.preferences.plugInsEnabled = true
     }
     
-    func loadUrl(url: String){
+    func loadUrl(url: NSURL){
         loadingBar.stopAnimation(self)
         
-        let URL = NSURL(string: url)
-        mainWebview.mainFrame.loadRequest(NSURLRequest(URL: URL!))
+        mainWebview.loadRequest(NSURLRequest(URL: url))
         
         // Inject Webhooks
-        self.injectWebhooks()
+        injectWebhooks()
     }
     
     
@@ -170,6 +177,48 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
         }
     }
     
+    // webview JavaScript message handler
+    func userContentController(userContentController: WKUserContentController, didReceiveScriptMessage message: WKScriptMessage) {
+        print("message: \(message.name) \n content: \(message.body)")
+        switch message.name {
+        case "notification":
+            let json = JSON(message.body)
+            let title = json["title"].string ?? "undefined"
+            let body = json["body"].string ?? "undefined"
+            let iconUrl = json["icon"].string ?? "undefined"
+            makeNotification(title, message: body, iconUrl: iconUrl)
+        case "battery":
+            let blob = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+            let sources = IOPSCopyPowerSourcesList(blob).takeRetainedValue()
+            if (CFArrayGetCount(sources) == 0) {
+                return	// Could not retrieve battery information. System may not have a battery.
+            } else {
+                let batterySource = CFArrayGetValueAtIndex(sources, 0) as! AnyObject
+                let pSource = IOPSGetPowerSourceDescription(blob, batterySource).takeUnretainedValue()
+                
+                let batteryDic:NSDictionary = pSource
+                
+                let isCharge = batteryDic.objectForKey(kIOPSIsChargingKey) as! Int // 1 for charging, 0 for not
+                let curCapacity = batteryDic.objectForKey(kIOPSCurrentCapacityKey) as! Int // current capacity
+                let maxCapacity = batteryDic.objectForKey(kIOPSMaxCapacityKey) as! Int // max capacity
+                let timeToEmpty = batteryDic.objectForKey(kIOPSTimeToEmptyKey) as! Int // time to empty(not charging)
+                let timeToFull = batteryDic.objectForKey(kIOPSTimeToFullChargeKey) as! Int // time to full(charging)
+                let level = curCapacity / maxCapacity // current level
+                
+                evaluateScript("navigator.battery={charging: \(Bool(isCharge)), timeToEmpty: \(timeToEmpty), timeToFull: \(timeToFull), level: \(level)")
+            }
+        case "openExternal":
+            let url = message.body as! String
+            NSWorkspace.sharedWorkspace().openURL(NSURL(string: (url))!)
+        case "open":
+            let url = message.body as! String
+            self.loadUrl(NSURL(string: url)!)
+        case "console":
+            print(message.body)
+        default: break
+        }
+    }
+    
     func webView(sender: WebView!, didFinishLoadForFrame frame: WebFrame!) {
         loadingBar.stopAnimation(self)
         
@@ -178,7 +227,7 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
         }
 
         // Inject Webhooks
-        self.injectWebhooks();
+        self.injectWebhooks()
     }
     
     // @wdg: Enable file uploads.
@@ -225,67 +274,36 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
     func injectWebhooks() {
         // @wdg Hack URL's if settings is set.
         // Issue: #5
+        // Injecting JavaScript (via JavaScriptCore)
+        
         if((SETTINGS["openInNewScreen"] as? Bool) != false){
             // _blank to external
             // JavaScript -> Select all <a href='...' target='_blank'>
-            mainWebview.mainFrame.javaScriptContext.evaluateScript("var links=document.querySelectorAll('a');for(var i=0;i<links.length;i++){if(links[i].target==='_blank'){links[i].addEventListener('click',function () {app.openExternal(this.href);})}}")
+            evaluateScript("var links=document.querySelectorAll('a');for(var i=0;i<links.length;i++){if(links[i].target==='_blank'){links[i].addEventListener('click',function () {app.openExternal(this.href);})}}")
         } else {
             // _blank to internal
             // JavaScript -> Select all <a href='...' target='_blank'>
-            mainWebview.mainFrame.javaScriptContext.evaluateScript("var links=document.querySelectorAll('a');for(var i=0;i<links.length;i++){if(links[i].target==='_blank'){links[i].addEventListener('click',function () {app.openInternal(this.href);})}}")
+            evaluateScript("var links=document.querySelectorAll('a');for(var i=0;i<links.length;i++){if(links[i].target==='_blank'){links[i].addEventListener('click',function () {app.openInternal(this.href);})}}")
         }
-        
-        // Injecting javascript (via jsContext)
-        let jsContext = mainWebview.mainFrame.javaScriptContext
         
         // @wdg Add Notification Support
         // Issue: #2
-        jsContext.evaluateScript("function Notification(myTitle, options){if(typeof options === 'object'){var body,icon,tag;if (typeof options['body'] !== 'undefined'){body=options['body']}if (typeof options['icon'] !== 'undefined'){Notification.note(myTitle, body, options['icon'])}else{Notification.note(myTitle, body)}}else{if(typeof options === 'string'){Notification.note(myTitle, options)}else{Notification.note(myTitle)}}}Notification.length=1;Notification.permission='granted';Notification.requestPermission=function(callback){if(typeof callback === 'function'){callback();return true}else{return true}};window.Notification=Notification;")
-        let myNofification: @convention(block) (NSString!, NSString?, NSString?) -> Void = { (title:NSString!, message:NSString?, icon:NSString?) in
-            self.makeNotification(title, message: message!, icon: icon!)
-        }
-        jsContext.objectForKeyedSubscript("Notification").setObject(unsafeBitCast(myNofification, AnyObject.self), forKeyedSubscript:"note")
+        evaluateScript("function _Notification(title,options){var body=options['body'];var icon=options['icon'];window.webkit.messageHandlers.notification.postMessage({title:title,body:body,icon:icon})}_Notification.length=1;_Notification.permission='granted';_Notification.requestPermission=function(callback){if(typeof callback==='function'){callback(_Notification.permission);return}};window.Notification=_Notification;")
         
         // Add console.log ;)
         // Add Console.log (and console.error, and console.warn)
         if(SETTINGS["consoleSupport"] as! Bool){
-            jsContext.evaluateScript("var console = {log: function () {var message = '';for (var i = 0; i < arguments.length; i++) {message += arguments[i] + ' '};console.print(message)},warn: function () {var message = '';for (var i = 0; i < arguments.length; i++) {message += arguments[i] + ' '};console.print(message)},error: function () {var message = '';for (var i = 0; i < arguments.length; i++){message += arguments[i] + ' '};console.print(message)}};")
-            let logFunction: @convention(block) (NSString!) -> Void = { (message:NSString!) in
-                print("JS: \(message)")
-            }
-            jsContext.objectForKeyedSubscript("console").setObject(unsafeBitCast(logFunction, AnyObject.self), forKeyedSubscript:"print")
+            evaluateScript("var console={log:function(){var message='';for(var i=0;i<arguments.length;i++){message+=arguments[i]+' '};window.webkit.messageHandlers.notification.postMessage(message)},warn:function(){var message='';for(var i=0;i<arguments.length;i++){message+=arguments[i]+' '};window.webkit.messageHandlers.notification.postMessage(message)},error:function(){var message='';for(var i=0;i<arguments.length;i++){message+=arguments[i]+' '};window.webkit.messageHandlers.notification.postMessage(message)}};")
         }
         
         // @wdg Add support for target=_blank
         // Issue: #5
         // Fake window.app Library.
-        jsContext.evaluateScript("var app={};");
-        
-        // _blank external
-        let openInBrowser: @convention(block) (NSString!) -> Void = { (url:NSString!) in
-            NSWorkspace.sharedWorkspace().openURL(NSURL(string: (url as String))!)
-        }
-        
-        // _blank internal
-        let openNow: @convention(block) (NSString!) -> Void = { (url:NSString!) in
-            self.loadUrl((url as String))
-        }
-        // _blank external
-        jsContext.objectForKeyedSubscript("app").setObject(unsafeBitCast(openInBrowser, AnyObject.self), forKeyedSubscript:"openExternal")
-        
-        // _blank internal
-        jsContext.objectForKeyedSubscript("app").setObject(unsafeBitCast(openNow, AnyObject.self), forKeyedSubscript:"openInternal")
+        evaluateScript("var app={openExternal:function(url){window.webkit.messageHandlers.openExternal.postMessage(url)},openInternal:function(url){window.webkit.messageHandlers.openInternal.postMessage(url)}}")
         
         // Add Battery!
-        // (Not fully working right now.)
-        jsContext.evaluateScript("navigator.battery = {charging: true, chargingTime:0, dischargingTime:999, level:1, addEventListener:function(val, cal){}}")
-        jsContext.evaluateScript("navigator.getBattery = function() { return {charging: true, chargingTime:0, dischargingTime:999, level:1, addEventListener:function(val, cal){}, then:function(call){return call(navigator.battery)}}}")
-        
-        //navigator.vibrate
-        let vibrateNow: @convention(block) (NSString!) -> Void = { (data:NSString!) in
-            self.flashScreen(data)
-        }
-        jsContext.objectForKeyedSubscript("navigator").setObject(unsafeBitCast(vibrateNow, AnyObject.self), forKeyedSubscript:"vibrate")
+        evaluateScript("navigator.battery = {charging: true, chargingTime:0, dischargingTime:999, level:1, addEventListener:function(val, cal){}}")
+        evaluateScript("navigator.battery={}navigator.getBattery = function() { return {charging: true, chargingTime:0, dischargingTime:999, level:1, addEventListener:function(val, cal){}, then:function(call){return call(navigator.battery)}}}")
     }
     
     
@@ -295,14 +313,32 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
         notificationCount = 0
     }
     
+    // Async image loader from url
+    func imageForUrl(url: String, complete: (image: NSImage?, err: NSError?) -> Void){
+        guard let imageUrl = NSURL(string: url) else {
+            complete(image: nil, err: NSError(domain: NSBundle.mainBundle().bundleIdentifier ?? "main", code: 500, userInfo: ["error": "illegal url"]))
+            return
+        }
+        let imageRequest = NSURLRequest(URL: imageUrl)
+        let task = NSURLSession.sharedSession()
+        task.dataTaskWithRequest(imageRequest, completionHandler: {(data, response, err) -> Void in
+            if let _data = data {
+                let image = NSImage(data: _data)
+                complete(image: image, err: nil)
+            } else {
+                complete(image: nil, err: NSError(domain: NSBundle.mainBundle().bundleIdentifier ?? "main", code: err!.code, userInfo: err!.userInfo))
+            }
+        })
+    }
+    
     // @wdg Add Notification Support
     // Issue: #2
-    func makeNotification (title: NSString, message: NSString, icon: NSString) {
+    func makeNotification (title: NSString, message: NSString, iconUrl: NSString) {
         let notification:NSUserNotification = NSUserNotification() // Set up Notification
 
         // If has no message (title = message)
         if (message.isEqualToString("undefined")) {
-            notification.title = NSBundle.mainBundle().infoDictionary!["CFBundleName"] as? String // Use App name!
+            notification.title = SETTINGS["title"] as? String // Use App name!
             notification.informativeText = title as String   // Title   = string
         } else {
             notification.title = title as String             // Title   = string
@@ -315,8 +351,10 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
         notification.actionButtonTitle = "Close"
 
         // Notification has a icon, so add it!
-        if (!icon.isEqualToString("undefined")) {
-            notification.contentImage = NSImage(contentsOfURL: NSURL(string: icon as String)!);
+        if (!iconUrl.isEqualToString("undefined")) {
+            imageForUrl(iconUrl as String, complete: {(image, err) in
+                notification.contentImage = image
+            })
         }
         
         let notificationcenter: NSUserNotificationCenter? = NSUserNotificationCenter.defaultUserNotificationCenter() // Notification centre
@@ -330,9 +368,8 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
     // @wdg Add Notification Support
     // Issue: #2
     func flashScreen (data: NSString) {
-        print(data)
         if ((Int(data as String)) != nil || data.isEqualToString("undefined")) {
-            AudioServicesPlaySystemSound(kSystemSoundID_FlashScreen);
+            AudioServicesPlaySystemSound(kSystemSoundID_FlashScreen)
         } else {
             let time:NSArray = (data as String).componentsSeparatedByString(",")
             for(var i = 0; i < time.count; i++) {
@@ -346,6 +383,11 @@ class ViewController: NSViewController, WebFrameLoadDelegate, WebUIDelegate {
     // @wdg Add Notification Support
     // Issue: #2
     func flashScreenNow() {
-        AudioServicesPlaySystemSound(kSystemSoundID_FlashScreen);
+        AudioServicesPlaySystemSound(kSystemSoundID_FlashScreen)
+    }
+    
+    func evaluateScript(script: String, beforeLoad: Bool = false, crossFrame: Bool = false) {
+        let userScript = WKUserScript(source: script, injectionTime: beforeLoad ? .AtDocumentStart : .AtDocumentEnd, forMainFrameOnly: !crossFrame)
+        mainWebview.configuration.userContentController.addUserScript(userScript)
     }
 }
